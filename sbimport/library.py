@@ -14,13 +14,26 @@ import zlib
 
 from . import vtree
 
+WINDOWS = os.name == 'nt'
 ZIP_MAGIC = b'#zip#\x00'
 PRESET_EXTS = ('.fst', '.fxp', '.vstpreset')
-DEFAULT_LIBRARY = os.path.expanduser('~/Library/Cableguys/ShaperBox3')
+# ShaperBox keeps its library in the user app-data folder: ~/Library on Mac, %APPDATA% on Windows.
 # Our own files (import history + database backups) live outside ShaperBox's folder.
-DATA_DIR = os.path.expanduser('~/Library/Application Support/ShaperBox Import')
+if WINDOWS:
+    APPDATA = os.environ.get('APPDATA') or os.path.expanduser(r'~\AppData\Roaming')
+    DEFAULT_LIBRARY = os.path.join(APPDATA, 'Cableguys', 'ShaperBox3')
+    DATA_DIR = os.path.join(APPDATA, 'ShaperBox Import')
+    # Searched when DEFAULT_LIBRARY isn't there, since that spot is unconfirmed on Windows.
+    CABLEGUYS_DIRS = [os.path.join(d, 'Cableguys') for d in
+                      (APPDATA, os.environ.get('LOCALAPPDATA'), os.environ.get('PROGRAMDATA')) if d]
+else:
+    DEFAULT_LIBRARY = os.path.expanduser('~/Library/Cableguys/ShaperBox3')
+    DATA_DIR = os.path.expanduser('~/Library/Application Support/ShaperBox Import')
 HISTORY = os.path.join(DATA_DIR, 'history.csv')
 HISTORY_FIELDS = ['hash', 'name', 'source']
+# What add_preset() writes to; anything else means a ShaperBox version this tool doesn't know.
+SCHEMA = {'presets': {'hash', 'name', 'author', 'liked', 'version', 'custom'},
+          'queue': {'command', 'table_name', 'row_key', 'row_subkey', 'column', 'value', 'state'}}
 # Order ShaperBox uses for the `custom` (module tag) column; module ids renamed in tags.
 TAG_ORDER = ['time', 'pitch', 'drive', 'noise', 'filter', 'liquid', 'crush', 'volume',
              'pan', 'reverb', 'width', 'compressor', 'oscilloscope']
@@ -85,8 +98,51 @@ def dat_path(lib, h):
     return os.path.join(lib, h[0], h[1], h + '.dat')
 
 
+def find_library():
+    """DEFAULT_LIBRARY, or on Windows a ShaperBox 3 presets.db anywhere under CABLEGUYS_DIRS."""
+    if WINDOWS and not os.path.exists(db_path(DEFAULT_LIBRARY)):
+        for root, folder in preset_dbs():
+            if 'shaperbox3' in os.path.relpath(folder, root).lower().replace(' ', ''):
+                return folder
+    return DEFAULT_LIBRARY
+
+
+def preset_dbs():
+    r"""Windows: (Cableguys folder, folder) for each presets.db under CABLEGUYS_DIRS. Other Cableguys
+    plugins keep theirs there too, nested deeper, e.g. Cableguys\VolumeShaper\3volumeshaper4\presets."""
+    for root in CABLEGUYS_DIRS:
+        for dp, _, files in os.walk(root):
+            if any(f.lower() == 'presets.db' for f in files):
+                yield root, dp
+
+
+def connect(lib):
+    return sqlite3.connect(db_path(lib), timeout=5)
+
+
+def library_problem(db, lib):
+    """Why this doesn't look like a library add_preset() can write to, or None if it does."""
+    for table, columns in SCHEMA.items():
+        if not columns <= {r[1] for r in db.execute(f'PRAGMA table_info({table})')}:
+            return f'the {table} table is different'
+    sample = [dat_path(lib, h) for (h,) in db.execute('SELECT hash FROM presets LIMIT 20')]
+    if sample and not any(is_preset_file(p) for p in sample):
+        return "preset files aren't where they should be"
+    return None
+
+
+def is_preset_file(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read(len(ZIP_MAGIC)) == ZIP_MAGIC
+    except OSError:
+        return False
+
+
 def apps_using(lib):
     """Names of other programs that have the preset database open (e.g. a DAW running ShaperBox)."""
+    if WINDOWS:
+        return ['your DAW'] if open_elsewhere(db_path(lib)) else []
     try:
         out = subprocess.run(['lsof', '-Fpc', db_path(lib)], capture_output=True, text=True).stdout
     except OSError:
@@ -98,6 +154,25 @@ def apps_using(lib):
         elif line.startswith('c') and pid != os.getpid():
             apps.add(line[1:])
     return sorted(apps)
+
+
+def open_elsewhere(path):
+    """Windows: True if any program (ours included) has path open. Windows can't cheaply say which
+    program, but opening a file with no sharing allowed fails while anything else holds it."""
+    # Not _winapi.CreateFile: on older Pythons (3.9, 3.10) it calls the ANSI API, which garbles non-ASCII paths
+    # (a username like Zoë) so the open fails for the wrong reason and the check passes.
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    h = k32.CreateFileW(path, 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, no sharing, OPEN_EXISTING
+    if h == wintypes.HANDLE(-1).value:  # INVALID_HANDLE_VALUE
+        return ctypes.get_last_error() == 32  # ERROR_SHARING_VIOLATION
+    k32.CloseHandle(h)
+    return False
 
 
 def backup(lib):
@@ -125,11 +200,10 @@ def new_hash(db, lib):
             return h
 
 
-def add_preset(db, lib, name, tree):
-    # Author stays empty: ShaperBox only shows author-less presets under My Presets.
+def add_preset(db, lib, h, name, tree):
+    # h comes from new_hash(). Author stays empty: ShaperBox only shows author-less presets under My Presets.
     tags = module_tags(tree)
     version, blob = prepare(tree, name)
-    h = new_hash(db, lib)
     path = dat_path(lib, h)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
@@ -142,7 +216,6 @@ def add_preset(db, lib, name, tree):
         for col, val in (('author', ''), ('custom', tags), ('liked', '0'), ('name', name), ('version', str(version))):
             db.execute(q, ('new__part', h, col, val))
         db.execute(q, ('new__end', h, '', ''))
-    return h
 
 
 def remove_presets(db, lib, hashes):
@@ -151,20 +224,22 @@ def remove_presets(db, lib, hashes):
             db.execute('DELETE FROM presets WHERE hash=?', (h,))
             db.execute('DELETE FROM queue WHERE row_key=?', (h,))
     for h in hashes:
-        if os.path.exists(dat_path(lib, h)):
+        try:
             os.remove(dat_path(lib, h))
+        except OSError:
+            pass  # already gone, or held open by another program; it's out of ShaperBox's list either way
 
 
 def read_history():
     if not os.path.exists(HISTORY):
         return []
-    with open(HISTORY, newline='') as f:
+    with open(HISTORY, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
 
 
 def write_history(rows):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(HISTORY, 'w', newline='') as f:
+    with open(HISTORY, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=HISTORY_FIELDS, extrasaction='ignore')
         w.writeheader()
         w.writerows(rows)
@@ -173,5 +248,5 @@ def write_history(rows):
 def add_history(row):
     if not os.path.exists(HISTORY):
         write_history([])
-    with open(HISTORY, 'a', newline='') as f:
+    with open(HISTORY, 'a', newline='', encoding='utf-8') as f:
         csv.DictWriter(f, fieldnames=HISTORY_FIELDS, extrasaction='ignore').writerow(row)
