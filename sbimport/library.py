@@ -25,7 +25,7 @@ if WINDOWS:
     DATA_DIR = os.path.join(APPDATA, 'ShaperBox Import')
     # Searched when DEFAULT_LIBRARY isn't there, since that spot is unconfirmed on Windows.
     CABLEGUYS_DIRS = [os.path.join(d, 'Cableguys') for d in
-                      (APPDATA, os.environ.get('LOCALAPPDATA'), os.environ.get('PROGRAMDATA')) if d]
+                      dict.fromkeys((APPDATA, os.environ.get('LOCALAPPDATA'), os.environ.get('PROGRAMDATA'))) if d]
 else:
     DEFAULT_LIBRARY = os.path.expanduser('~/Library/Cableguys/ShaperBox3')
     DATA_DIR = os.path.expanduser('~/Library/Application Support/ShaperBox Import')
@@ -98,22 +98,16 @@ def dat_path(lib, h):
     return os.path.join(lib, h[0], h[1], h + '.dat')
 
 
-def find_library():
-    """DEFAULT_LIBRARY, or on Windows a ShaperBox 3 presets.db anywhere under CABLEGUYS_DIRS."""
-    if WINDOWS and not os.path.exists(db_path(DEFAULT_LIBRARY)):
-        for root, folder in preset_dbs():
-            if 'shaperbox3' in os.path.relpath(folder, root).lower().replace(' ', ''):
-                return folder
-    return DEFAULT_LIBRARY
-
-
-def preset_dbs():
-    r"""Windows: (Cableguys folder, folder) for each presets.db under CABLEGUYS_DIRS. Other Cableguys
+def preset_folders():
+    r"""Windows: the folders with a presets.db under CABLEGUYS_DIRS, as (ShaperBox 3's, the rest). Other Cableguys
     plugins keep theirs there too, nested deeper, e.g. Cableguys\VolumeShaper\3volumeshaper4\presets."""
+    ours, others = [], []
     for root in CABLEGUYS_DIRS:
         for dp, _, files in os.walk(root):
             if any(f.lower() == 'presets.db' for f in files):
-                yield root, dp
+                shaperbox = 'shaperbox3' in os.path.relpath(dp, root).lower().replace(' ', '')
+                (ours if shaperbox else others).append(dp)
+    return ours, others
 
 
 def connect(lib):
@@ -142,7 +136,7 @@ def is_preset_file(path):
 def apps_using(lib):
     """Names of other programs that have the preset database open (e.g. a DAW running ShaperBox)."""
     if WINDOWS:
-        return ['your DAW'] if open_elsewhere(db_path(lib)) else []
+        return ['another program (most likely your DAW)'] if open_elsewhere(db_path(lib)) else []
     try:
         out = subprocess.run(['lsof', '-Fpc', db_path(lib)], capture_output=True, text=True).stdout
     except OSError:
@@ -156,9 +150,11 @@ def apps_using(lib):
     return sorted(apps)
 
 
-def open_elsewhere(path):
-    """Windows: True if any program (ours included) has path open. Windows can't cheaply say which
-    program, but opening a file with no sharing allowed fails while anything else holds it."""
+def open_elsewhere(path, wait=2):
+    """Windows: True if any program (ours included) keeps path open. Windows can't cheaply say which
+    program, but opening a file with no sharing allowed fails while anything else holds it. A virus
+    scanner or the search indexer holds it only briefly, so that has to last `wait` seconds to count.
+    Raises OSError when the open fails for any other reason, since then there's no telling."""
     # Not _winapi.CreateFile: on older Pythons (3.9, 3.10) it calls the ANSI API, which garbles non-ASCII paths
     # (a username like Zoë) so the open fails for the wrong reason and the check passes.
     import ctypes
@@ -168,11 +164,18 @@ def open_elsewhere(path):
                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
     k32.CreateFileW.restype = wintypes.HANDLE
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    h = k32.CreateFileW(path, 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, no sharing, OPEN_EXISTING
-    if h == wintypes.HANDLE(-1).value:  # INVALID_HANDLE_VALUE
-        return ctypes.get_last_error() == 32  # ERROR_SHARING_VIOLATION
-    k32.CloseHandle(h)
-    return False
+    deadline = time.monotonic() + wait
+    while True:
+        h = k32.CreateFileW(path, 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, no sharing, OPEN_EXISTING
+        if h != wintypes.HANDLE(-1).value:  # INVALID_HANDLE_VALUE
+            k32.CloseHandle(h)
+            return False
+        err = ctypes.get_last_error()
+        if err != 32:  # ERROR_SHARING_VIOLATION
+            raise ctypes.WinError(err)
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.25)
 
 
 def backup(lib):
@@ -206,28 +209,44 @@ def add_preset(db, lib, h, name, tree):
     version, blob = prepare(tree, name)
     path = dat_path(lib, h)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'wb') as f:
-        f.write(blob)
-    with db:
-        db.execute("INSERT INTO presets(hash,name,author,liked,version,custom) VALUES(?,?,'','0',?,?)",
-                   (h, name, version, tags))
-        q = "INSERT INTO queue(command,table_name,row_key,row_subkey,column,value,state) VALUES(?,'presets',?,'',?,?,0)"
-        db.execute(q, ('new__begin', h, '', ''))
-        for col, val in (('author', ''), ('custom', tags), ('liked', '0'), ('name', name), ('version', str(version))):
-            db.execute(q, ('new__part', h, col, val))
-        db.execute(q, ('new__end', h, '', ''))
+    try:
+        with open(path, 'wb') as f:
+            f.write(blob)
+        with db:
+            db.execute("INSERT INTO presets(hash,name,author,liked,version,custom) VALUES(?,?,'','0',?,?)",
+                       (h, name, version, tags))
+            q = ("INSERT INTO queue(command,table_name,row_key,row_subkey,column,value,state)"
+                 " VALUES(?,'presets',?,'',?,?,0)")
+            db.execute(q, ('new__begin', h, '', ''))
+            for col, val in (('author', ''), ('custom', tags), ('liked', '0'), ('name', name),
+                             ('version', str(version))):
+                db.execute(q, ('new__part', h, col, val))
+            db.execute(q, ('new__end', h, '', ''))
+    except BaseException:  # Ctrl+C too
+        # Don't leave a file behind that ShaperBox's list doesn't know about. If that fails as well, --undo gets it.
+        try:
+            if not db.execute('SELECT 1 FROM presets WHERE hash=?', (h,)).fetchone():
+                os.remove(path)
+        except (OSError, sqlite3.Error):
+            pass
+        raise
 
 
 def remove_presets(db, lib, hashes):
+    """Returns the hashes whose .dat file couldn't be deleted; those are out of ShaperBox's list all the same."""
     with db:
         for h in hashes:
             db.execute('DELETE FROM presets WHERE hash=?', (h,))
             db.execute('DELETE FROM queue WHERE row_key=?', (h,))
+    stuck = []
     for h in hashes:
         try:
             os.remove(dat_path(lib, h))
-        except OSError:
-            pass  # already gone, or held open by another program; it's out of ShaperBox's list either way
+        except FileNotFoundError:
+            pass
+        except OSError:  # held open by another program, or read-only
+            stuck.append(h)
+    return stuck
 
 
 def read_history():

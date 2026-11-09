@@ -12,6 +12,7 @@ import argparse
 import os
 import re
 import shlex
+import sqlite3
 import sys
 from contextlib import closing
 
@@ -45,7 +46,10 @@ def split_paths(line):
     if not whole or os.path.exists(os.path.expanduser(whole)):
         return [whole] if whole else []
     if library.WINDOWS:
-        return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', line)]
+        # PowerShell pastes 'C:\My Presets' instead, with any ' doubled. A quoted path can follow a bare one
+        # with no space between, so a bare one stops at a ".
+        found = re.findall(r'''"([^"]*)"|'((?:[^']|'')*)'|([^\s"]+)''', line)
+        return [p for p in (dq or sq.replace("''", "'") or bare for dq, sq, bare in found) if p]
     try:
         return shlex.split(line)
     except ValueError:
@@ -53,7 +57,10 @@ def split_paths(line):
 
 
 def ensure_closed(lib):
-    apps = library.apps_using(lib)
+    try:
+        apps = library.apps_using(lib)
+    except OSError as e:
+        sys.exit(f"\nCouldn't check whether ShaperBox is open ({e}).\nNothing was changed.")
     if apps:
         sys.exit(f'\nShaperBox is open in: {", ".join(apps)}\nQuit it first, then run this again.')
 
@@ -98,7 +105,7 @@ def run_import(args, lib):
             try:
                 tree = library.read_state(r['source'])
                 h = library.new_hash(db, lib)
-                # History first, so --undo covers the preset even if adding it fails halfway.
+                # History first, so --undo covers the preset's file even if adding it is cut short.
                 library.add_history({'hash': h, 'name': r['name'], 'source': r['source']})
                 library.add_preset(db, lib, h, r['name'], tree)
             except Exception as e:
@@ -110,9 +117,12 @@ def run_import(args, lib):
 
 
 def run_undo(args, lib):
-    ours = {r['hash'] for r in library.read_history()}
+    # history.csv can be edited or damaged; only real hashes get turned into file paths.
+    ours = {r['hash'] for r in library.read_history() if re.fullmatch('[0-9a-f]{32}', r['hash'] or '')}
     with closing(library.connect(lib)) as db:
-        hashes = [h for (h,) in db.execute('SELECT hash FROM presets') if h in ours]
+        listed = {h for (h,) in db.execute('SELECT hash FROM presets')}
+    # Not only the listed ones: an import that was cut short, or an earlier undo, can leave just the file.
+    hashes = sorted(h for h in ours if h in listed or os.path.exists(library.dat_path(lib, h)))
     if not hashes:
         print('Nothing to undo: no presets imported by this tool are in your library.')
         return
@@ -122,9 +132,35 @@ def run_undo(args, lib):
         return
     backup = library.backup(lib)
     with closing(library.connect(lib)) as db:
-        library.remove_presets(db, lib, hashes)
-    library.write_history([])
-    print(f'Removed {len(hashes)} presets. (Backup of your preset list: {backup})')
+        stuck = set(library.remove_presets(db, lib, hashes))
+    library.write_history([r for r in library.read_history() if r['hash'] in stuck])
+    print(f'Removed {len(hashes) - len(stuck)} presets. (Backup of your preset list: {backup})')
+    if stuck:
+        print(f"{len(stuck)} more are gone from ShaperBox's list, but their files couldn't be deleted\n"
+              '(in use by another program, or read-only). Run --undo again later to delete them.')
+
+
+def pick_library(args):
+    """The library folder to use. Exits with what was found if it's missing or there's more than one."""
+    lib = os.path.expanduser(args.library) if args.library else library.DEFAULT_LIBRARY
+    if os.path.exists(library.db_path(lib)):
+        return lib
+    ours, others = library.preset_folders() if library.WINDOWS else ([], [])
+    if not args.library and len(ours) == 1:
+        return ours[0]
+
+    def listing(title, folders):
+        return f'\n\n{title}\n' + '\n'.join(f'  {f}' for f in folders) if folders else ''
+
+    if not args.library and ours:
+        sys.exit('Found more than one ShaperBox 3 preset library on this PC.'
+                 + listing('The libraries:', ours)
+                 + '\n\nTo use one of them, open Command Prompt in this folder and run this with its path:\n'
+                 f'  py -3 import_presets.py --library "{ours[0]}"')
+    sys.exit(f"Couldn't find ShaperBox 3's preset library at {lib}\n"
+             'Open ShaperBox 3 once in your DAW, then try again.'
+             + listing('ShaperBox 3 preset folders on this PC:', ours)
+             + listing('Other Cableguys preset folders on this PC:', others))
 
 
 def main():
@@ -144,30 +180,31 @@ def main():
         sys.exit("This Python is the Microsoft Store version, which can't save into ShaperBox's folder.\n"
                  'Install Python from python.org/downloads and uninstall the Store one\n'
                  '(Settings > Apps > Installed apps), then run this again.')
-    lib = os.path.expanduser(args.library) if args.library else library.find_library()
-    if not os.path.exists(library.db_path(lib)):
-        msg = (f"Couldn't find ShaperBox 3's preset library at {lib}\n"
-               'Open ShaperBox 3 once in your DAW, then try again.')
-        others = [folder for _, folder in library.preset_dbs()] if library.WINDOWS else []
-        if others:
-            msg += '\n\nOther Cableguys preset folders on this PC:\n' + '\n'.join(f'  {f}' for f in others)
-        sys.exit(msg)
-    with closing(library.connect(lib)) as db:
-        problem = library.library_problem(db, lib)
-    if problem:
-        sys.exit(f"ShaperBox's library at {lib} doesn't look the way this tool expects ({problem}).\n"
-                 'Nothing was changed.')
-    if args.undo:
-        run_undo(args, lib)
-        return
-    if not args.folders:
-        args.folders = ask_for_folders(lib)
+    lib = pick_library(args)
+    try:
+        if args.undo:
+            run_undo(args, lib)
+            return
+        if not args.preview:
+            # Only importing writes everything this checks; --undo and --preview have to work without it.
+            with closing(library.connect(lib)) as db:
+                problem = library.library_problem(db, lib)
+            if problem:
+                sys.exit(f"ShaperBox's library at {lib} doesn't look the way this tool expects ({problem}).\n"
+                         'Nothing was changed.')
         if not args.folders:
-            sys.exit('No folder given.')
-    for f in args.folders:
-        if not os.path.exists(os.path.expanduser(f)):
-            sys.exit(f"Couldn't find {f}")
-    run_import(args, lib)
+            args.folders = ask_for_folders(lib)
+            if not args.folders:
+                sys.exit('No folder given.')
+        for f in args.folders:
+            if not os.path.exists(os.path.expanduser(f)):
+                sys.exit(f"Couldn't find {f}")
+        run_import(args, lib)
+    except sqlite3.Error as e:
+        if 'locked' in str(e):
+            sys.exit("\nShaperBox's preset list is in use by another program, most likely your DAW.\n"
+                     'Quit it first, then run this again.')
+        sys.exit(f"\nCouldn't read ShaperBox's preset list at {library.db_path(lib)} ({e}).\nNothing was changed.")
 
 
 if __name__ == '__main__':

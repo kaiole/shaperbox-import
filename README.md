@@ -37,4 +37,5 @@ In Terminal (on Windows, Command Prompt with `py -3` instead of `python3`):
 ```
 python3 import_presets.py --preview path/to/presets   # show names, import nothing
 python3 import_presets.py --undo                      # remove everything this tool imported
+python3 import_presets.py --library path/to/library   # use this ShaperBox 3 library folder (the one with presets.db)
 ```
